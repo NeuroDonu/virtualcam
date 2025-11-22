@@ -1,0 +1,3 @@
+1. add v4l2 / v4l, (linux support)
+2. add CU kernels for GPU decoding stream
+3. speed up, maybe
