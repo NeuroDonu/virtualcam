@@ -263,18 +263,105 @@ fn bgr_to_i420(src: &[u8], width: u32, height: u32) -> Vec<u8> {
 }
 
 fn rgb_to_nv12(src: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let i420 = rgb_to_i420(src, width, height);
-    i420_to_nv12(&i420, width, height)
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let uv_size = y_size / 2;
+
+    let mut dst = vec![0u8; y_size + uv_size];
+    let (y_plane, uv_plane) = dst.split_at_mut(y_size);
+
+    // Process all pixels for Y, and every 2x2 block for UV
+    for y in 0..h {
+        let row_offset = y * w;
+        for x in 0..w {
+            let idx = (row_offset + x) * 3;
+            let r = src[idx] as i32;
+            let g = src[idx + 1] as i32;
+            let b = src[idx + 2] as i32;
+
+            // Y
+            let yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            y_plane[row_offset + x] = yy.clamp(0, 255) as u8;
+
+            // UV for 2x2 blocks (top-left pixel only)
+            if (x & 1) == 0 && (y & 1) == 0 {
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let uv_idx = (y >> 1) * w + x;
+                uv_plane[uv_idx] = u.clamp(0, 255) as u8;
+                uv_plane[uv_idx + 1] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    dst
 }
 
 fn bgr_to_nv12(src: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let i420 = bgr_to_i420(src, width, height);
-    i420_to_nv12(&i420, width, height)
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let uv_size = y_size / 2;
+
+    let mut dst = vec![0u8; y_size + uv_size];
+    let (y_plane, uv_plane) = dst.split_at_mut(y_size);
+
+    for y in 0..h {
+        let row_offset = y * w;
+        for x in 0..w {
+            let idx = (row_offset + x) * 3;
+            let b = src[idx] as i32;
+            let g = src[idx + 1] as i32;
+            let r = src[idx + 2] as i32;
+
+            let yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            y_plane[row_offset + x] = yy.clamp(0, 255) as u8;
+
+            if (x & 1) == 0 && (y & 1) == 0 {
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let uv_idx = (y >> 1) * w + x;
+                uv_plane[uv_idx] = u.clamp(0, 255) as u8;
+                uv_plane[uv_idx + 1] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    dst
 }
 
 fn rgba_to_nv12(src: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let rgb = rgba_to_rgb(src);
-    rgb_to_nv12(&rgb, width, height)
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let uv_size = y_size / 2;
+
+    let mut dst = vec![0u8; y_size + uv_size];
+    let (y_plane, uv_plane) = dst.split_at_mut(y_size);
+
+    for y in 0..h {
+        let row_offset = y * w;
+        for x in 0..w {
+            let idx = (row_offset + x) * 4;
+            let r = src[idx] as i32;
+            let g = src[idx + 1] as i32;
+            let b = src[idx + 2] as i32;
+
+            let yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            y_plane[row_offset + x] = yy.clamp(0, 255) as u8;
+
+            if (x & 1) == 0 && (y & 1) == 0 {
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let uv_idx = (y >> 1) * w + x;
+                uv_plane[uv_idx] = u.clamp(0, 255) as u8;
+                uv_plane[uv_idx + 1] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    dst
 }
 
 // I420 <-> NV12 conversions

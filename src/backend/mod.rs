@@ -8,6 +8,12 @@ pub mod windows_obs;
 #[cfg(windows)]
 pub mod windows_unity;
 
+#[cfg(target_os = "linux")]
+pub mod linux_v4l2;
+
+#[cfg(feature = "cuda")]
+pub mod cuda_convert;
+
 /// Backend trait that all virtual camera implementations must implement
 pub trait Backend: Send {
     /// Get the name of this backend
@@ -72,6 +78,20 @@ pub fn available_backends() -> Vec<BackendInfo> {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        // V4L2 Loopback - Linux backend
+        #[cfg(feature = "v4l2")]
+        if linux_v4l2::is_available() {
+            backends.push(BackendInfo {
+                name: "v4l2loopback",
+                description: "V4L2 Loopback",
+                default_device: "/dev/video0",
+                native_format: PixelFormat::I420,
+            });
+        }
+    }
+
     backends
 }
 
@@ -92,6 +112,11 @@ pub fn create_backend(
         #[cfg(all(windows, feature = "unity-capture"))]
         "unitycapture" => {
             let backend = windows_unity::UnityCaptureBackend::new(width, height, fps, device)?;
+            Ok(Box::new(backend))
+        }
+        #[cfg(all(target_os = "linux", feature = "v4l2"))]
+        "v4l2loopback" | "v4l2" => {
+            let backend = linux_v4l2::V4l2Backend::new(width, height, fps, device)?;
             Ok(Box::new(backend))
         }
         _ => Err(crate::error::VirtualCamError::BackendNotAvailable(
