@@ -1,17 +1,19 @@
 //! CUDA-accelerated image format conversion
 //!
 //! This module provides GPU-accelerated conversion between pixel formats
-//! using cudarc. Enabled with the "cuda" feature.
+//! using cudarc Driver API. Enabled with the "cuda" feature.
+//!
+//! PTX kernels are precompiled at build time by build.rs using nvcc.
 
 use crate::error::{Result, VirtualCamError};
 use crate::pixel_format::PixelFormat;
 
 use cudarc::driver::safe::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::driver::Ptx;
 use std::sync::Arc;
 
-/// CUDA source code embedded at compile time
-const CONVERTER_CU: &str = include_str!("kernels/converter.cu");
+/// Precompiled PTX embedded at compile time (built by build.rs)
+const CONVERTER_PTX: &str = include_str!("kernels/converter.ptx");
 
 /// CUDA converter for fast GPU-based format conversion
 pub struct CudaConverter {
@@ -41,10 +43,8 @@ impl CudaConverter {
 
         let stream = ctx.default_stream();
 
-        // Compile PTX from CUDA source at runtime
-        let ptx = compile_ptx(CONVERTER_CU).map_err(|e| {
-            VirtualCamError::InitializationFailed(format!("Failed to compile CUDA: {}", e))
-        })?;
+        // Load precompiled PTX (built by build.rs)
+        let ptx = Ptx::from_src(CONVERTER_PTX);
 
         let module = ctx.load_module(ptx).map_err(|e| {
             VirtualCamError::InitializationFailed(format!("Failed to load PTX: {}", e))

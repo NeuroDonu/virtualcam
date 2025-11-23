@@ -54,4 +54,4 @@ cuda = ["cudarc"]
 [dependencies.cudarc]
 version = "0.18"
 optional = true
-features = ["driver", "nvrtc"]
+features = ["driver"]
