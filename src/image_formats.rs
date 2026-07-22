@@ -2,6 +2,58 @@
 
 use crate::pixel_format::PixelFormat;
 
+/// Scale tightly packed RGB24 with nearest sampling and convert it to NV12.
+/// The destination allocation is reused across frames.
+pub fn rgb24_to_nv12_scaled_into(
+    rgb: &[u8],
+    source_width: u32,
+    source_height: u32,
+    destination: &mut Vec<u8>,
+    output_width: u32,
+    output_height: u32,
+) {
+    let output_len = (output_width * output_height * 3 / 2) as usize;
+    destination.resize(output_len, 0);
+    let source_width = source_width as usize;
+    let source_height = source_height as usize;
+    let output_width = output_width as usize;
+    let output_height = output_height as usize;
+    let y_plane_len = output_width * output_height;
+    let (y_plane, uv_plane) = destination.split_at_mut(y_plane_len);
+
+    for output_y in 0..output_height {
+        let source_y = output_y * source_height / output_height;
+        for output_x in 0..output_width {
+            let source_x = output_x * source_width / output_width;
+            let offset = (source_y * source_width + source_x) * 3;
+            let (y, _, _) = rgb_to_yuv(rgb[offset], rgb[offset + 1], rgb[offset + 2]);
+            y_plane[output_y * output_width + output_x] = y;
+        }
+    }
+
+    for output_y in (0..output_height).step_by(2) {
+        for output_x in (0..output_width).step_by(2) {
+            let mut r = 0u32;
+            let mut g = 0u32;
+            let mut b = 0u32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let source_x = (output_x + dx) * source_width / output_width;
+                    let source_y = (output_y + dy) * source_height / output_height;
+                    let offset = (source_y * source_width + source_x) * 3;
+                    r += u32::from(rgb[offset]);
+                    g += u32::from(rgb[offset + 1]);
+                    b += u32::from(rgb[offset + 2]);
+                }
+            }
+            let (_, u, v) = rgb_to_yuv((r / 4) as u8, (g / 4) as u8, (b / 4) as u8);
+            let uv_offset = (output_y / 2) * output_width + output_x;
+            uv_plane[uv_offset] = u;
+            uv_plane[uv_offset + 1] = v;
+        }
+    }
+}
+
 /// Convert frame from one pixel format to another
 pub fn convert_frame(
     src: &[u8],
@@ -41,36 +93,25 @@ pub fn convert_frame(
         // I420 conversions
         (PixelFormat::I420, PixelFormat::NV12) => i420_to_nv12(src, width, height),
         (PixelFormat::I420, PixelFormat::RGBA) => i420_to_rgba(src, width, height),
+        (PixelFormat::I420, PixelFormat::RGB) => rgba_to_rgb(&i420_to_rgba(src, width, height)),
 
         // NV12 conversions
         (PixelFormat::NV12, PixelFormat::I420) => nv12_to_i420(src, width, height),
         (PixelFormat::NV12, PixelFormat::RGBA) => nv12_to_rgba(src, width, height),
+        (PixelFormat::NV12, PixelFormat::RGB) => rgba_to_rgb(&nv12_to_rgba(src, width, height)),
 
         // YUYV conversions
         (PixelFormat::YUYV, PixelFormat::NV12) => yuyv_to_nv12(src, width, height),
         (PixelFormat::YUYV, PixelFormat::RGBA) => yuyv_to_rgba(src, width, height),
+        (PixelFormat::YUYV, PixelFormat::RGB) => rgba_to_rgb(&yuyv_to_rgba(src, width, height)),
 
         // UYVY conversions
         (PixelFormat::UYVY, PixelFormat::NV12) => uyvy_to_nv12(src, width, height),
         (PixelFormat::UYVY, PixelFormat::RGBA) => uyvy_to_rgba(src, width, height),
+        (PixelFormat::UYVY, PixelFormat::RGB) => rgba_to_rgb(&uyvy_to_rgba(src, width, height)),
 
         // Unsupported conversions - return empty
         _ => Vec::new(),
-    }
-}
-
-/// Flip frame vertically (for Unity Capture)
-pub fn flip_vertical(data: &mut [u8], width: u32, height: u32, bytes_per_pixel: u32) {
-    let stride = (width * bytes_per_pixel) as usize;
-    let mut temp = vec![0u8; stride];
-
-    for y in 0..(height as usize / 2) {
-        let top_offset = y * stride;
-        let bottom_offset = (height as usize - 1 - y) * stride;
-
-        temp.copy_from_slice(&data[top_offset..top_offset + stride]);
-        data.copy_within(bottom_offset..bottom_offset + stride, top_offset);
-        data[bottom_offset..bottom_offset + stride].copy_from_slice(&temp);
     }
 }
 
@@ -78,9 +119,9 @@ pub fn flip_vertical(data: &mut [u8], width: u32, height: u32, bytes_per_pixel: 
 fn rgb_to_bgr(src: &[u8]) -> Vec<u8> {
     let mut dst = vec![0u8; src.len()];
     for i in (0..src.len()).step_by(3) {
-        dst[i] = src[i + 2];     // B
+        dst[i] = src[i + 2]; // B
         dst[i + 1] = src[i + 1]; // G
-        dst[i + 2] = src[i];     // R
+        dst[i + 2] = src[i]; // R
     }
     dst
 }
@@ -106,9 +147,9 @@ fn bgr_to_rgba(src: &[u8]) -> Vec<u8> {
     let pixels = src.len() / 3;
     let mut dst = vec![255u8; pixels * 4];
     for i in 0..pixels {
-        dst[i * 4] = src[i * 3 + 2];     // R
+        dst[i * 4] = src[i * 3 + 2]; // R
         dst[i * 4 + 1] = src[i * 3 + 1]; // G
-        dst[i * 4 + 2] = src[i * 3];     // B
+        dst[i * 4 + 2] = src[i * 3]; // B
         // Alpha is already 255
     }
     dst
@@ -130,9 +171,9 @@ fn rgba_to_bgr(src: &[u8]) -> Vec<u8> {
     let pixels = src.len() / 4;
     let mut dst = vec![0u8; pixels * 3];
     for i in 0..pixels {
-        dst[i * 3] = src[i * 4 + 2];     // B
+        dst[i * 3] = src[i * 4 + 2]; // B
         dst[i * 3 + 1] = src[i * 4 + 1]; // G
-        dst[i * 3 + 2] = src[i * 4];     // R
+        dst[i * 3 + 2] = src[i * 4]; // R
     }
     dst
 }
@@ -642,8 +683,8 @@ mod tests {
         let uv_size = y_size / 4;
 
         let mut i420 = vec![0u8; y_size + uv_size * 2];
-        for i in 0..y_size {
-            i420[i] = i as u8;
+        for (index, value) in i420.iter_mut().take(y_size).enumerate() {
+            *value = index as u8;
         }
         for i in 0..uv_size {
             i420[y_size + i] = 100 + i as u8;
@@ -654,5 +695,15 @@ mod tests {
         let back = nv12_to_i420(&nv12, width, height);
 
         assert_eq!(i420, back);
+    }
+
+    #[test]
+    fn scaled_rgb_to_nv12_preserves_solid_color() {
+        let rgb = [255, 0, 0].repeat(4);
+        let mut nv12 = Vec::new();
+        rgb24_to_nv12_scaled_into(&rgb, 2, 2, &mut nv12, 4, 4);
+        assert_eq!(nv12.len(), 24);
+        assert!(nv12[..16].iter().all(|&value| value == 82));
+        assert!(nv12[16..].chunks_exact(2).all(|uv| uv == [90, 240]));
     }
 }

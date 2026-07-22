@@ -1,10 +1,13 @@
 //! Main Camera struct and public API
 
-use crate::backend::{self, Backend};
+use crate::backend::{self, Backend, BackendKind};
 use crate::error::{Result, VirtualCamError};
-use crate::image_formats::{convert_frame, flip_vertical};
+use crate::image_formats::{convert_frame, rgb24_to_nv12_scaled_into};
 use crate::pixel_format::PixelFormat;
 use crate::util::{FpsCounter, FrameTimer};
+
+#[cfg(feature = "gpu")]
+use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
 
 /// Builder for creating a Camera with custom configuration
 pub struct CameraBuilder {
@@ -13,7 +16,7 @@ pub struct CameraBuilder {
     fps: f64,
     format: PixelFormat,
     device: Option<String>,
-    backend: Option<String>,
+    backend: BackendKind,
     print_fps: bool,
 }
 
@@ -26,7 +29,7 @@ impl CameraBuilder {
             fps,
             format: PixelFormat::RGB,
             device: None,
-            backend: None,
+            backend: BackendKind::Auto,
             print_fps: false,
         }
     }
@@ -43,9 +46,10 @@ impl CameraBuilder {
         self
     }
 
-    /// Set the backend to use (e.g., "obs", "unitycapture")
-    pub fn backend(mut self, backend: impl Into<String>) -> Self {
-        self.backend = Some(backend.into());
+    /// Select a backend. `Auto` prefers Media Foundation on Windows 11,
+    /// falls back to OBS on Windows 10/11, and uses V4L2 on Linux.
+    pub fn backend(mut self, backend: BackendKind) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -63,7 +67,7 @@ impl CameraBuilder {
             self.fps,
             self.format,
             self.device.as_deref(),
-            self.backend.as_deref(),
+            Some(self.backend.as_str()),
             self.print_fps,
         )
     }
@@ -87,6 +91,9 @@ pub struct Camera {
 
     // Conversion buffer
     conversion_buffer: Vec<u8>,
+    rgb_buffer: Vec<u8>,
+    #[cfg(feature = "gpu")]
+    pinned_frame: Option<PinnedHostSlice<u8>>,
 }
 
 impl Camera {
@@ -122,23 +129,29 @@ impl Camera {
         if width == 0 || height == 0 {
             return Err(VirtualCamError::InvalidDimensions(width, height));
         }
+        if (format.requires_even_width() && width % 2 != 0)
+            || (format.requires_even_height() && height % 2 != 0)
+        {
+            return Err(VirtualCamError::InvalidDimensions(width, height));
+        }
 
         if fps <= 0.0 || fps > 1000.0 {
             return Err(VirtualCamError::InvalidFps(fps));
         }
 
         // Create backend
-        let backend = if let Some(name) = backend_name {
-            backend::create_backend(name, width, height, fps, device)?
-        } else {
-            backend::create_any_backend(width, height, fps, device)?
-        };
+        let kind = backend_name.unwrap_or("auto").parse::<BackendKind>()?;
+        let backend = backend::create_backend(kind, width, height, fps, device)?;
 
         let backend_name_str = backend.name().to_string();
 
         log::info!(
             "Camera created: {}x{} @ {} fps, format: {}, backend: {}",
-            width, height, fps, format, backend_name_str
+            width,
+            height,
+            fps,
+            format,
+            backend_name_str
         );
 
         Ok(Self {
@@ -154,6 +167,9 @@ impl Camera {
             print_fps,
             last_fps_print: std::time::Instant::now(),
             conversion_buffer: Vec::new(),
+            rgb_buffer: Vec::new(),
+            #[cfg(feature = "gpu")]
+            pinned_frame: None,
         })
     }
 
@@ -186,25 +202,123 @@ impl Camera {
             });
         }
 
-        // Convert frame to native format if needed
+        // Convert and, for fixed-format backends, scale to native dimensions.
         let native_format = self.backend.native_format();
-        let frame_to_send = if self.format == native_format {
+        let (native_width, native_height) = self.backend.native_dimensions();
+        let same_dimensions = (self.width, self.height) == (native_width, native_height);
+        let frame_to_send = if self.format == native_format && same_dimensions {
             frame
-        } else {
-            // Convert format
-            self.conversion_buffer = convert_frame(frame, self.format, native_format, self.width, self.height);
-
-            // For Unity Capture, flip vertically
-            if self.backend.name() == "unitycapture" && native_format == PixelFormat::RGBA {
-                flip_vertical(&mut self.conversion_buffer, self.width, self.height, 4);
-            }
-
+        } else if native_format == PixelFormat::NV12 && !same_dimensions {
+            let rgb = if self.format == PixelFormat::RGB {
+                frame
+            } else {
+                self.rgb_buffer = convert_frame(
+                    frame,
+                    self.format,
+                    PixelFormat::RGB,
+                    self.width,
+                    self.height,
+                );
+                if self.rgb_buffer.is_empty() {
+                    return Err(VirtualCamError::UnsupportedFormat(format!(
+                        "{} -> RGB",
+                        self.format
+                    )));
+                }
+                &self.rgb_buffer
+            };
+            rgb24_to_nv12_scaled_into(
+                rgb,
+                self.width,
+                self.height,
+                &mut self.conversion_buffer,
+                native_width,
+                native_height,
+            );
             &self.conversion_buffer
+        } else if same_dimensions {
+            self.conversion_buffer =
+                convert_frame(frame, self.format, native_format, self.width, self.height);
+            if self.conversion_buffer.is_empty() {
+                return Err(VirtualCamError::UnsupportedFormat(format!(
+                    "{} -> {}",
+                    self.format, native_format
+                )));
+            }
+            &self.conversion_buffer
+        } else {
+            return Err(VirtualCamError::UnsupportedFormat(format!(
+                "scaling {} -> {} is not implemented",
+                self.format, native_format
+            )));
         };
 
-        // Send frame
         self.backend.send(frame_to_send)?;
+        self.record_frame();
+        Ok(())
+    }
 
+    /// Send a frame already encoded in the backend's native format and size.
+    pub fn send_native(&mut self, frame: &[u8]) -> Result<()> {
+        let (width, height) = self.backend.native_dimensions();
+        let expected = self.backend.native_format().frame_size(width, height);
+        if frame.len() != expected {
+            return Err(VirtualCamError::FrameSizeMismatch {
+                expected,
+                actual: frame.len(),
+            });
+        }
+        self.backend.send(frame)?;
+        self.record_frame();
+        Ok(())
+    }
+
+    /// Download a device-resident native frame through one reusable pinned
+    /// allocation, then publish it through the selected Windows backend.
+    #[cfg(feature = "gpu")]
+    pub fn send_native_gpu(
+        &mut self,
+        stream: &std::sync::Arc<CudaStream>,
+        frame: &CudaSlice<u8>,
+    ) -> Result<()> {
+        let (width, height) = self.backend.native_dimensions();
+        let expected = self.backend.native_format().frame_size(width, height);
+        if frame.len() != expected {
+            return Err(VirtualCamError::FrameSizeMismatch {
+                expected,
+                actual: frame.len(),
+            });
+        }
+        if self.pinned_frame.is_none() {
+            self.pinned_frame = Some(
+                unsafe { stream.context().alloc_pinned::<u8>(expected) }
+                    .map_err(|error| VirtualCamError::SendFailed(error.to_string()))?,
+            );
+        }
+        let pinned = self
+            .pinned_frame
+            .as_mut()
+            .expect("pinned frame initialized");
+        stream
+            .memcpy_dtoh(
+                frame,
+                pinned
+                    .as_mut_slice()
+                    .map_err(|error| VirtualCamError::SendFailed(error.to_string()))?,
+            )
+            .map_err(|error| VirtualCamError::SendFailed(error.to_string()))?;
+        stream
+            .synchronize()
+            .map_err(|error| VirtualCamError::SendFailed(error.to_string()))?;
+        let host = pinned
+            .as_slice()
+            .map_err(|error| VirtualCamError::SendFailed(error.to_string()))?;
+        self.backend.send(host)?;
+        self.record_frame();
+        Ok(())
+    }
+
+    fn record_frame(&mut self) {
         // Update counters
         self.frames_sent += 1;
         self.fps_counter.tick();
@@ -215,8 +329,6 @@ impl Camera {
             println!("FPS: {:.1}", self.fps_counter.fps());
             self.last_fps_print = std::time::Instant::now();
         }
-
-        Ok(())
     }
 
     /// Sleep until the next frame is due
@@ -267,6 +379,10 @@ impl Camera {
     /// Get the native format used by the backend
     pub fn native_format(&self) -> PixelFormat {
         self.backend.native_format()
+    }
+
+    pub fn native_dimensions(&self) -> (u32, u32) {
+        self.backend.native_dimensions()
     }
 
     /// Get the backend name

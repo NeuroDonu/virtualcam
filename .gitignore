@@ -22,3 +22,13 @@ target
 
 Cargo.lock
 pyvirtualcam
+
+# Visual Studio native runtime output and restored packages
+cpp/VCam/.vs/
+cpp/VCam/packages/
+cpp/VCam/x64/
+cpp/VCam/Debug/
+cpp/VCam/Release/
+*.user
+*.suo
+*.VC.db

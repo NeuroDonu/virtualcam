@@ -1,16 +1,17 @@
 //! OBS Virtual Camera backend for Windows
 
+use super::Backend;
 use crate::error::{Result, VirtualCamError};
 use crate::pixel_format::PixelFormat;
 use std::ptr;
-use super::Backend;
-use winreg::enums::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 use winreg::RegKey;
+use winreg::enums::*;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
-    FILE_MAP_ALL_ACCESS, FILE_MAP_READ, PAGE_READWRITE,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, MapViewOfFile, OpenFileMappingW,
+    PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows::core::PCWSTR;
 
@@ -56,19 +57,22 @@ pub struct ObsBackend {
 // Queue header structure (must match OBS exactly)
 #[repr(C)]
 struct QueueHeader {
-    write_idx: u32,      // volatile
-    read_idx: u32,       // volatile
-    state: u32,          // volatile
+    write_idx: AtomicU32,
+    read_idx: AtomicU32,
+    state: AtomicU32,
 
-    offsets: [u32; 3],   // Byte offsets for 3 frame buffers
-    queue_type: u32,     // Always 0 for video
+    offsets: [u32; 3], // Byte offsets for 3 frame buffers
+    queue_type: u32,   // Always 0 for video
 
-    cx: u32,             // Frame width
-    cy: u32,             // Frame height
-    interval: u64,       // Frame interval in 100-ns units
+    cx: u32,       // Frame width
+    cy: u32,       // Frame height
+    interval: u64, // Frame interval in 100-ns units
 
-    reserved: [u32; 8],  // Reserved space
+    reserved: [u32; 8], // Reserved space
 }
+
+const _: () = assert!(std::mem::size_of::<AtomicU32>() == 4);
+const _: () = assert!(std::mem::size_of::<QueueHeader>() == 80);
 
 unsafe impl Send for ObsBackend {}
 
@@ -87,16 +91,28 @@ impl ObsBackend {
         if device_name != DEVICE_NAME && device.is_some() {
             return Err(VirtualCamError::DeviceNotFound(device_name.to_string()));
         }
+        if width % 2 != 0 || height % 2 != 0 {
+            return Err(VirtualCamError::InvalidDimensions(width, height));
+        }
 
+        Self::open_queue(width, height, fps, device_name, VIDEO_QUEUE_NAME)
+    }
+
+    fn open_queue(
+        width: u32,
+        height: u32,
+        fps: f64,
+        device_name: &str,
+        mapping_name: &str,
+    ) -> Result<Self> {
         // Check if already in use (try to open existing)
-        let queue_name: Vec<u16> = VIDEO_QUEUE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let queue_name: Vec<u16> = mapping_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         unsafe {
-            let existing = OpenFileMappingW(
-                FILE_MAP_READ.0,
-                false,
-                PCWSTR(queue_name.as_ptr()),
-            );
+            let existing = OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(queue_name.as_ptr()));
 
             if let Ok(handle) = existing {
                 CloseHandle(handle).ok();
@@ -105,7 +121,8 @@ impl ObsBackend {
         }
 
         // Calculate frame sizes
-        let frame_size = (width * height * 3 / 2) as usize; // NV12 format
+        let frame_size = usize::try_from(u64::from(width) * u64::from(height) * 3 / 2)
+            .map_err(|_| VirtualCamError::InvalidDimensions(width, height))?;
 
         // Calculate total size with alignment
         let mut size = std::mem::size_of::<QueueHeader>();
@@ -114,9 +131,13 @@ impl ObsBackend {
         let mut offsets = [0u32; 3];
         for i in 0..3 {
             offsets[i] = size as u32;
-            size += FRAME_HEADER_SIZE + frame_size;
+            size = size
+                .checked_add(FRAME_HEADER_SIZE + frame_size)
+                .ok_or_else(|| VirtualCamError::InvalidDimensions(width, height))?;
             size = align_size(size);
         }
+        let mapping_size =
+            u32::try_from(size).map_err(|_| VirtualCamError::InvalidDimensions(width, height))?;
 
         // Create shared memory
         let file_mapping = unsafe {
@@ -125,7 +146,7 @@ impl ObsBackend {
                 None,
                 PAGE_READWRITE,
                 0,
-                size as u32,
+                mapping_size,
                 PCWSTR(queue_name.as_ptr()),
             )?
         };
@@ -136,9 +157,7 @@ impl ObsBackend {
             ));
         }
 
-        let mapped = unsafe {
-            MapViewOfFile(file_mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0)
-        };
+        let mapped = unsafe { MapViewOfFile(file_mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
 
         if mapped.Value.is_null() {
             unsafe { CloseHandle(file_mapping).ok() };
@@ -153,9 +172,11 @@ impl ObsBackend {
         let interval = (10_000_000.0 / fps) as u64; // 100-nanosecond units
 
         unsafe {
-            (*header).write_idx = 0;
-            (*header).read_idx = 0;
-            (*header).state = SHARED_QUEUE_STATE_STARTING;
+            (*header).write_idx.store(0, Ordering::Relaxed);
+            (*header).read_idx.store(0, Ordering::Relaxed);
+            (*header)
+                .state
+                .store(SHARED_QUEUE_STATE_STARTING, Ordering::Release);
             (*header).offsets = offsets;
             (*header).queue_type = 0; // Video
             (*header).cx = width;
@@ -177,7 +198,12 @@ impl ObsBackend {
             }
         }
 
-        log::info!("OBS Virtual Camera initialized: {}x{} @ {} fps", width, height, fps);
+        log::info!(
+            "OBS Virtual Camera initialized: {}x{} @ {} fps",
+            width,
+            height,
+            fps
+        );
 
         Ok(Self {
             width,
@@ -198,8 +224,10 @@ impl ObsBackend {
 
         unsafe {
             // Increment write index
-            let write_idx = (*self.header).write_idx.wrapping_add(1);
-            (*self.header).write_idx = write_idx;
+            let write_idx = (*self.header)
+                .write_idx
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
 
             // Get buffer index (triple buffering)
             let idx = (write_idx % 3) as usize;
@@ -211,10 +239,12 @@ impl ObsBackend {
             ptr::copy_nonoverlapping(frame.as_ptr(), self.frame_data[idx], frame.len());
 
             // Update read index
-            (*self.header).read_idx = write_idx;
+            (*self.header).read_idx.store(write_idx, Ordering::Release);
 
             // Mark as ready
-            (*self.header).state = SHARED_QUEUE_STATE_READY;
+            (*self.header)
+                .state
+                .store(SHARED_QUEUE_STATE_READY, Ordering::Release);
         }
 
         Ok(())
@@ -232,6 +262,10 @@ impl Backend for ObsBackend {
 
     fn native_format(&self) -> PixelFormat {
         PixelFormat::NV12
+    }
+
+    fn native_dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     fn send(&mut self, frame: &[u8]) -> Result<()> {
@@ -258,7 +292,7 @@ impl Backend for ObsBackend {
         // Mark queue as stopping
         if !self.header.is_null() {
             unsafe {
-                (*self.header).state = 3; // STOPPING
+                (*self.header).state.store(3, Ordering::Release);
             }
         }
 
@@ -267,7 +301,8 @@ impl Backend for ObsBackend {
             if !self.header.is_null() {
                 UnmapViewOfFile(windows::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: self.header as *mut _,
-                }).ok();
+                })
+                .ok();
                 self.header = ptr::null_mut();
             }
 
@@ -309,5 +344,27 @@ fn get_timestamp_100ns() -> u64 {
         ((counter as u128 * 10_000_000) / frequency as u128) as u64
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_the_obs_three_slot_protocol() {
+        let mapping = format!("Local\\virtualcam-obs-test-{}", std::process::id());
+        let mut backend = ObsBackend::open_queue(2, 2, 30.0, DEVICE_NAME, &mapping).unwrap();
+        let frame = [16, 16, 16, 16, 128, 128];
+        backend.send(&frame).unwrap();
+
+        unsafe {
+            assert_eq!((*backend.header).read_idx.load(Ordering::Acquire), 1);
+            assert_eq!(
+                (*backend.header).state.load(Ordering::Acquire),
+                SHARED_QUEUE_STATE_READY
+            );
+            assert_eq!(std::slice::from_raw_parts(backend.frame_data[1], 6), frame);
+        }
     }
 }

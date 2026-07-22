@@ -40,14 +40,13 @@ fn main() -> virtualcam::error::Result<()> {
         let offset = (frame_num as f32 * 0.05) % 1.0;
 
         // Calculate color per row (much faster than per pixel)
-        for y in 0..height {
+        for (y, color) in row_colors.iter_mut().enumerate() {
             let t = ((y as f32 / height as f32) + offset) % 1.0;
-            row_colors[y] = hsv_to_rgb(t, 0.9, 1.0);
+            *color = hsv_to_rgb(t, 0.9, 1.0);
         }
 
         // Fill frame by rows
-        for y in 0..height {
-            let (r, g, b) = row_colors[y];
+        for (y, &(r, g, b)) in row_colors.iter().enumerate() {
             let row_start = y * width * 3;
             for x in 0..width {
                 let idx = row_start + x * 3;
@@ -64,11 +63,7 @@ fn main() -> virtualcam::error::Result<()> {
 
         // Print stats every second
         if frame_num % 60 == 0 {
-            println!(
-                "Frame {}: {:.1} FPS",
-                cam.frames_sent(),
-                cam.current_fps()
-            );
+            println!("Frame {}: {:.1} FPS", cam.frames_sent(), cam.current_fps());
         }
     }
 

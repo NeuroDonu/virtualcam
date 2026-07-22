@@ -6,11 +6,17 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, VirtualCamError>;
 
 /// Errors that can occur when working with virtual cameras
-#[derive(Error, Debug)]
+#[derive(Error)]
 pub enum VirtualCamError {
     /// No virtual camera device was found
-    #[error("No virtual camera device found. Please install OBS Virtual Camera or Unity Video Capture")]
+    #[error("No virtual camera backend is available (VCam, OBS, or v4l2loopback)")]
     NoDeviceFound,
+
+    /// Linux has no configured v4l2loopback output device
+    #[error(
+        "No v4l2loopback output device found. Create one before starting the application, for example: sudo modprobe v4l2loopback video_nr=10 card_label=\"Virtual Camera\" exclusive_caps=1. Run the application itself as your normal user."
+    )]
+    V4l2LoopbackNotFound,
 
     /// The specified device was not found
     #[error("Device '{0}' not found")]
@@ -88,4 +94,22 @@ pub enum VirtualCamError {
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+impl std::fmt::Debug for VirtualCamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VirtualCamError;
+
+    #[test]
+    fn missing_loopback_error_is_actionable() {
+        let message = VirtualCamError::V4l2LoopbackNotFound.to_string();
+        assert!(message.contains("sudo modprobe v4l2loopback"));
+        assert!(message.contains("normal user"));
+    }
 }

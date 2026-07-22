@@ -1,9 +1,10 @@
 //! Pixel format definitions
 
 /// Supported pixel formats for virtual camera frames
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum PixelFormat {
     /// RGB format, 3 bytes per pixel (Red, Green, Blue)
+    #[default]
     RGB,
     /// BGR format, 3 bytes per pixel (Blue, Green, Red) - OpenCV default
     BGR,
@@ -76,14 +77,30 @@ impl PixelFormat {
         }
     }
 
-    /// Check if this format is planar (separate Y, U, V planes)
+    /// Check if this format has separate Y, U and V planes.
     pub fn is_planar(&self) -> bool {
-        matches!(self, PixelFormat::I420 | PixelFormat::NV12)
+        matches!(self, PixelFormat::I420)
+    }
+
+    /// Check if this format has one Y plane followed by interleaved UV.
+    pub fn is_semiplanar(&self) -> bool {
+        matches!(self, PixelFormat::NV12)
     }
 
     /// Check if this format is packed YUV
     pub fn is_packed_yuv(&self) -> bool {
         matches!(self, PixelFormat::YUYV | PixelFormat::UYVY)
+    }
+
+    pub fn requires_even_width(&self) -> bool {
+        matches!(
+            self,
+            PixelFormat::I420 | PixelFormat::NV12 | PixelFormat::YUYV | PixelFormat::UYVY
+        )
+    }
+
+    pub fn requires_even_height(&self) -> bool {
+        matches!(self, PixelFormat::I420 | PixelFormat::NV12)
     }
 
     /// Get format name as string
@@ -122,12 +139,6 @@ impl std::fmt::Display for PixelFormat {
     }
 }
 
-impl Default for PixelFormat {
-    fn default() -> Self {
-        PixelFormat::RGB
-    }
-}
-
 /// Encode a 4-byte FourCC code to a u32
 pub fn encode_fourcc(bytes: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*bytes)
@@ -162,14 +173,23 @@ mod tests {
         assert_eq!(PixelFormat::RGB.frame_size(width, height), 1920 * 1080 * 3);
         assert_eq!(PixelFormat::RGBA.frame_size(width, height), 1920 * 1080 * 4);
         assert_eq!(PixelFormat::GRAY.frame_size(width, height), 1920 * 1080);
-        assert_eq!(PixelFormat::I420.frame_size(width, height), 1920 * 1080 * 3 / 2);
+        assert_eq!(
+            PixelFormat::I420.frame_size(width, height),
+            1920 * 1080 * 3 / 2
+        );
         assert_eq!(PixelFormat::YUYV.frame_size(width, height), 1920 * 1080 * 2);
     }
 
     #[test]
     fn test_from_fourcc() {
-        assert_eq!(PixelFormat::from_fourcc(encode_fourcc(b"I420")), Some(PixelFormat::I420));
-        assert_eq!(PixelFormat::from_fourcc(encode_fourcc(b"NV12")), Some(PixelFormat::NV12));
+        assert_eq!(
+            PixelFormat::from_fourcc(encode_fourcc(b"I420")),
+            Some(PixelFormat::I420)
+        );
+        assert_eq!(
+            PixelFormat::from_fourcc(encode_fourcc(b"NV12")),
+            Some(PixelFormat::NV12)
+        );
         assert_eq!(PixelFormat::from_fourcc(0), None);
     }
 }
