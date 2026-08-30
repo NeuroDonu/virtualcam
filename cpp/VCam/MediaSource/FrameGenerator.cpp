@@ -125,6 +125,54 @@ HRESULT FrameGenerator::Generate(IMFSample* sample, REFGUID format, IMFSample** 
 	RETURN_HR_IF_NULL(E_POINTER, outSample);
 	*outSample = nullptr;
 
+	// The production path is already NV12. Read shared memory before touching
+	// any D2D/WIC resource; before the first producer frame emit cheap black.
+	{
+		wil::com_ptr_nothrow<IMFMediaBuffer> pumpBuffer;
+		RETURN_IF_FAILED(sample->GetBufferByIndex(0, &pumpBuffer));
+		wil::com_ptr_nothrow<IMF2DBuffer2> pumpBuffer2D;
+		BYTE* scanline = nullptr;
+		LONG pitch = 0;
+		BYTE* start = nullptr;
+		DWORD length = 0;
+		RETURN_IF_FAILED(pumpBuffer->QueryInterface(IID_PPV_ARGS(&pumpBuffer2D)));
+		RETURN_IF_FAILED(pumpBuffer2D->Lock2DSize(
+			MF2DBuffer_LockFlags_Write, &scanline, &pitch, &start, &length));
+		if (!scanline || !vcam::contract::IsValidForwardNv12Destination(
+			pitch, length, _width, _height))
+		{
+			const auto unlockHr = pumpBuffer2D->Unlock2D();
+			RETURN_IF_FAILED(unlockHr);
+			return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+		}
+
+		auto pumpHr = _pump.CopyLatestFrame(scanline, pitch, length, _width, _height);
+		if (pumpHr == S_FALSE)
+		{
+			const auto rowBytes = static_cast<DWORD>(pitch);
+			const auto required = rowBytes * _height + rowBytes * (_height / 2);
+			if (!scanline || rowBytes < _width || length < required)
+			{
+				pumpHr = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+			}
+			else
+			{
+				FillMemory(scanline, rowBytes * _height, 16);
+				FillMemory(scanline + static_cast<size_t>(rowBytes) * _height,
+					rowBytes * (_height / 2), 128);
+				pumpHr = S_OK;
+			}
+		}
+		const auto unlockHr = pumpBuffer2D->Unlock2D();
+		RETURN_IF_FAILED(pumpHr);
+		RETURN_IF_FAILED(unlockHr);
+
+		_frame++;
+		sample->AddRef();
+		*outSample = sample;
+		return S_OK;
+	}
+
 	// render something on image common to CPU & GPU
 	if (_renderTarget && _textFormat && _dwrite && _whiteBrush)
 	{
@@ -242,6 +290,13 @@ HRESULT FrameGenerator::Generate(IMFSample* sample, REFGUID format, IMFSample** 
     DWORD length;
     RETURN_IF_FAILED(mediaBuffer->QueryInterface(IID_PPV_ARGS(&buffer2D)));
     RETURN_IF_FAILED(buffer2D->Lock2DSize(MF2DBuffer_LockFlags_Write, &scanline, &pitch, &start, &length));
+    if (!scanline || !vcam::contract::IsValidForwardNv12Destination(
+        pitch, length, _width, _height))
+    {
+        const auto unlockHr = buffer2D->Unlock2D();
+        RETURN_IF_FAILED(unlockHr);
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
 
     // External pump: copy NV12 frame from shared memory if available.
     auto pumpHr = _pump.CopyLatestFrame(scanline, pitch, length, _width, _height);

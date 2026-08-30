@@ -32,3 +32,15 @@ cpp/VCam/Release/
 *.user
 *.suo
 *.VC.db
+
+# Repository-local dependencies, runtime payloads, and generated artifacts
+/vendor/
+/tools/
+/libs/
+/models/
+/runtime/
+/test/
+/test-results/
+/dist/
+/artifacts/
+/tmp/

@@ -1,40 +1,29 @@
-// FramePump.h — shared memory IPC for external frame injection.
-//
-// Rust VirtualCameraWriter creates a file mapping "Global\vcam_frames"
-// with layout [Header][NV12 frame w*h*3/2] and writes frames there.
-// C++ side (FrameGenerator::Generate, in VCamSource.dll loaded by Frame
-// Server) opens the same mapping, reads the latest frame, memcpy into the MF
-// sample buffer.
-//
-// Layout:
-//   struct Header { u32 magic; u32 width; u32 height; u32 seq; u32 ready; u32 pad[3]; }
-//   u8 frame[width * height * 3 / 2]   // NV12: Y plane + interleaved UV
-//
-// "Global\" prefix so Frame Server (running as Local Service) can see it
-// across sessions. Rust must create with CreateFileMappingW(Global\...,
-// security DACL granting Local Service read access).
+// FramePump.h - versioned shared-memory transport for external NV12 frames.
 #pragma once
 
 #include <Windows.h>
 #include <cstdint>
+#include <vector>
 
 class FramePump
 {
 public:
-    #pragma pack(push, 1)
-    struct Header {
-        uint32_t magic;
+    using Header = vcam::contract::SharedHeader;
+    using HeaderSnapshot = vcam::contract::HeaderSnapshot;
+
+    struct Format {
         uint32_t width;
         uint32_t height;
-        uint32_t seq;       // incremented per frame by the Rust writer
-        uint32_t ready;     // 0 = empty, 1 = frame available
-        uint32_t pad[3];
+        uint32_t fpsNumerator;
+        uint32_t fpsDenominator;
     };
-    #pragma pack(pop)
 
     static constexpr DWORD kHeaderSize = sizeof(Header);
+    static constexpr SIZE_T kMappingSize =
+        static_cast<SIZE_T>(kHeaderSize) + vcam::contract::MaxFrameBytes;
+    static_assert(kHeaderSize == vcam::contract::HeaderWords * sizeof(uint32_t));
 
-    FramePump() : _mapping(nullptr), _view(nullptr), _lastSeq(0) {}
+    FramePump() : _mapping(nullptr), _view(nullptr) {}
 
     ~FramePump()
     {
@@ -42,91 +31,168 @@ public:
         if (_mapping) CloseHandle(_mapping);
     }
 
-    // Try to open the shared memory mapping created by the Rust sender.
-    // Returns S_OK if mapping is open and header looks valid, else error.
-    // Safe to call repeatedly — re-opens if mapping was lost.
-    HRESULT EnsureConnected()
+    HRESULT ReadFormat(Format* format)
     {
-        if (_view) {
-            // Still mapped; verify header is alive.
-            auto* hdr = static_cast<Header*>(_view);
-            if (hdr->magic == vcam::contract::SharedMemoryMagic) return S_OK;
-        }
+        if (!format) return E_POINTER;
+        *format = DefaultFormat();
 
-        if (!_mapping) {
-            _mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, vcam::contract::SharedMemoryName);
-            if (!_mapping) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-        }
+        auto hr = EnsureConnected();
+        if (FAILED(hr)) return hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ? S_OK : hr;
 
-        if (!_view) {
-            _view = MapViewOfFile(_mapping, FILE_MAP_READ, 0, 0, 0);
-            if (!_view) {
-                CloseHandle(_mapping);
-                _mapping = nullptr;
-                return HRESULT_FROM_WIN32(GetLastError());
-            }
-        }
-
-        auto* hdr = static_cast<Header*>(_view);
-        if (hdr->magic != vcam::contract::SharedMemoryMagic) {
-            // Sender hasn't initialized the header yet.
-            return E_NOTIMPL;
-        }
-        return S_OK;
+        HeaderSnapshot snapshot{};
+        hr = CaptureValidatedHeader(&snapshot, format);
+        return hr == S_FALSE ? S_OK : hr;
     }
 
-    // Copy the latest frame into the provided MF sample buffer.
-    // `dst` is the locked IMF2DBuffer2 scanline pointer, `dstLen` is its length.
-    // Returns S_OK if a fresh frame was copied, S_FALSE if no new frame, else error.
     HRESULT CopyLatestFrame(uint8_t* dst, LONG dstPitch, DWORD dstLen,
         uint32_t expectedWidth, uint32_t expectedHeight)
     {
         auto hr = EnsureConnected();
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) return CopyCachedFrame(dst, dstPitch, dstLen, expectedWidth, expectedHeight);
 
-        auto* hdr = static_cast<Header*>(_view);
-        if (!hdr->ready) return S_FALSE;            // no frame yet
-        // The mapping is FILE_MAP_READ. An Interlocked RMW used as a load would
-        // fault on this page, so use an aligned volatile load plus barriers.
-        const auto seqBefore = *reinterpret_cast<volatile const uint32_t*>(&hdr->seq);
-        MemoryBarrier();
-        if (seqBefore & 1) return S_FALSE;           // writer is mid-copy
-        if (seqBefore == _lastSeq) return S_FALSE;   // already copied this one
-        if (hdr->width != expectedWidth || hdr->height != expectedHeight) {
+        HeaderSnapshot observed{};
+        Format format{};
+        hr = CaptureValidatedHeader(&observed, &format);
+        if (hr == S_FALSE) {
+            return CopyCachedFrame(dst, dstPitch, dstLen, expectedWidth, expectedHeight);
+        }
+        if (FAILED(hr)) return hr;
+        if (format.width != expectedWidth || format.height != expectedHeight) {
             return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
         }
-
-        // NV12 frame size = width * height * 3 / 2
-        const DWORD pitch = static_cast<DWORD>(dstPitch < 0 ? -dstPitch : dstPitch);
-        const DWORD required = pitch * hdr->height + pitch * (hdr->height / 2);
-        if (!dst || pitch < hdr->width || dstLen < required) {
-            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        const auto snapshot = observed;
+        if (!snapshot.ready) {
+            return CopyCachedFrame(dst, dstPitch, dstLen, expectedWidth, expectedHeight);
         }
+
+        size_t pitch = 0;
+        RETURN_IF_FAILED(ValidateDestination(
+            dst, dstPitch, dstLen, snapshot.width, snapshot.height, &pitch));
 
         auto* src = static_cast<uint8_t*>(_view) + kHeaderSize;
-        // IMF2DBuffer2 surfaces may pad each row. Copy the Y and UV planes
-        // row-by-row instead of assuming a tightly packed destination.
-        for (uint32_t y = 0; y < hdr->height; ++y) {
-            CopyMemory(dst + y * pitch, src + y * hdr->width, hdr->width);
+        for (uint32_t y = 0; y < snapshot.height; ++y) {
+            CopyMemory(dst + static_cast<size_t>(y) * pitch,
+                src + static_cast<size_t>(y) * snapshot.width, snapshot.width);
         }
-        auto* srcUV = src + hdr->width * hdr->height;
-        auto* dstUV = dst + pitch * hdr->height;
-        for (uint32_t y = 0; y < hdr->height / 2; ++y) {
-            CopyMemory(dstUV + y * pitch, srcUV + y * hdr->width, hdr->width);
+        auto* srcUV = src + static_cast<size_t>(snapshot.width) * snapshot.height;
+        auto* dstUV = dst + pitch * snapshot.height;
+        for (uint32_t y = 0; y < snapshot.height / 2; ++y) {
+            CopyMemory(dstUV + static_cast<size_t>(y) * pitch,
+                srcUV + static_cast<size_t>(y) * snapshot.width, snapshot.width);
         }
+
         MemoryBarrier();
-        const auto seqAfter = *reinterpret_cast<volatile const uint32_t*>(&hdr->seq);
-        if (seqAfter != seqBefore || (seqAfter & 1)) return S_FALSE;
-        _lastSeq = seqAfter;
+        const auto seqAfter = static_cast<volatile const Header*>(_view)->seq;
+        if (seqAfter != snapshot.seq || (seqAfter & 1)) {
+            return CopyCachedFrame(dst, dstPitch, dstLen, expectedWidth, expectedHeight);
+        }
+
+        _cachedFrame.resize(snapshot.frameBytes);
+        for (uint32_t y = 0; y < snapshot.height; ++y) {
+            CopyMemory(_cachedFrame.data() + static_cast<size_t>(y) * snapshot.width,
+                dst + static_cast<size_t>(y) * pitch, snapshot.width);
+        }
+        auto* cachedUV = _cachedFrame.data()
+            + static_cast<size_t>(snapshot.width) * snapshot.height;
+        for (uint32_t y = 0; y < snapshot.height / 2; ++y) {
+            CopyMemory(cachedUV + static_cast<size_t>(y) * snapshot.width,
+                dstUV + static_cast<size_t>(y) * pitch, snapshot.width);
+        }
+        _hasCachedFrame = true;
         return S_OK;
     }
 
-    // Accessors for FrameGenerator to query negotiated size.
-    uint32_t Width() const  { return _view ? static_cast<Header*>(_view)->width  : 0; }
-    uint32_t Height() const { return _view ? static_cast<Header*>(_view)->height : 0; }
-
 private:
+    static constexpr Format DefaultFormat()
+    {
+        return {
+            vcam::contract::DefaultWidth,
+            vcam::contract::DefaultHeight,
+            vcam::contract::DefaultFpsNumerator,
+            vcam::contract::DefaultFpsDenominator,
+        };
+    }
+
+    HRESULT EnsureConnected()
+    {
+        if (_view) return S_OK;
+        if (!_mapping) {
+            _mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, vcam::contract::SharedMemoryName);
+            if (!_mapping) return HRESULT_FROM_WIN32(GetLastError());
+        }
+        _view = MapViewOfFile(_mapping, FILE_MAP_READ, 0, 0, kMappingSize);
+        if (!_view) {
+            const auto error = GetLastError();
+            CloseHandle(_mapping);
+            _mapping = nullptr;
+            return HRESULT_FROM_WIN32(error);
+        }
+        return S_OK;
+    }
+
+    HRESULT CaptureValidatedHeader(HeaderSnapshot* snapshot, Format* format) const
+    {
+        if (!_view || !snapshot || !format) return E_POINTER;
+
+        const auto* header = static_cast<volatile const Header*>(_view);
+        const auto seqBefore = header->seq;
+        MemoryBarrier();
+        const auto observed = vcam::contract::SnapshotHeader(*header);
+        MemoryBarrier();
+        const auto seqAfter = header->seq;
+
+        if (!vcam::contract::IsStableSequence(seqBefore, observed, seqAfter)) {
+            return S_FALSE;
+        }
+        if (observed.magic == 0) return S_FALSE;
+        if (!vcam::contract::IsValidHeaderSnapshot(observed)) {
+            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        }
+
+        *snapshot = observed;
+        *format = {
+            observed.width,
+            observed.height,
+            observed.fpsNumerator,
+            observed.fpsDenominator,
+        };
+        return S_OK;
+    }
+
+    static HRESULT ValidateDestination(uint8_t* dst, LONG dstPitch, DWORD dstLen,
+        uint32_t width, uint32_t height, size_t* pitch)
+    {
+        if (!pitch) return E_POINTER;
+        if (!dst || !vcam::contract::IsValidForwardNv12Destination(
+            dstPitch, dstLen, width, height)) {
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        }
+        *pitch = static_cast<size_t>(dstPitch);
+        return S_OK;
+    }
+
+    HRESULT CopyCachedFrame(uint8_t* dst, LONG dstPitch, DWORD dstLen,
+        uint32_t width, uint32_t height) const
+    {
+        size_t pitch = 0;
+        RETURN_IF_FAILED(ValidateDestination(dst, dstPitch, dstLen, width, height, &pitch));
+        const size_t frameSize = static_cast<size_t>(width) * height * 3 / 2;
+        if (!_hasCachedFrame || _cachedFrame.size() != frameSize) return S_FALSE;
+        for (uint32_t y = 0; y < height; ++y) {
+            CopyMemory(dst + static_cast<size_t>(y) * pitch,
+                _cachedFrame.data() + static_cast<size_t>(y) * width, width);
+        }
+        auto* dstUV = dst + static_cast<size_t>(pitch) * height;
+        auto* cachedUV = _cachedFrame.data() + static_cast<size_t>(width) * height;
+        for (uint32_t y = 0; y < height / 2; ++y) {
+            CopyMemory(dstUV + static_cast<size_t>(y) * pitch,
+                cachedUV + static_cast<size_t>(y) * width, width);
+        }
+        return S_OK;
+    }
+
     HANDLE _mapping;
     void* _view;
-    uint32_t _lastSeq;
+    std::vector<uint8_t> _cachedFrame;
+    bool _hasCachedFrame = false;
 };

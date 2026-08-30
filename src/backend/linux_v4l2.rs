@@ -22,13 +22,14 @@
 
 use std::ffi::c_void;
 use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 
 use anyhow::{Context, ensure};
 use libc::{c_int, c_ulong, c_void as libc_c_void, off_t, size_t};
 
-use super::Backend;
+use super::{Backend, ShutdownHandle};
 use crate::error::{Result, VirtualCamError};
 use crate::pixel_format::PixelFormat;
 
@@ -211,6 +212,7 @@ struct MmapWriter {
     height: u32,
     frame_size: usize,
     buffers: Vec<MmapBuffer>,
+    shutdown: ShutdownHandle,
 }
 
 // The mapping and descriptor have one owner and can safely move as a unit to
@@ -234,6 +236,23 @@ fn zeroed<T>() -> T {
     unsafe { std::mem::zeroed() }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DequeueDecision {
+    Retry,
+    Shutdown,
+    Fail,
+}
+
+fn dequeue_decision(raw_error: i32, shutdown: &ShutdownHandle) -> DequeueDecision {
+    if shutdown.is_requested() {
+        DequeueDecision::Shutdown
+    } else if raw_error == libc::EFAULT || raw_error == libc::EAGAIN {
+        DequeueDecision::Retry
+    } else {
+        DequeueDecision::Fail
+    }
+}
+
 impl MmapWriter {
     /// Open a v4l2loopback device and set up the mmap streaming pipeline.
     ///
@@ -242,10 +261,13 @@ impl MmapWriter {
     ///   sudo modprobe v4l2loopback video_nr=10 exclusive_caps=1
     pub fn open(device_num: u32, width: u32, height: u32, fps: u32) -> anyhow::Result<Self> {
         let dev_path = format!("/dev/video{device_num}");
-        // O_RDWR required for mmap (O_WRONLY fails mmap with EACCES on MAP_SHARED).
+        // O_RDWR is required for mmap (O_WRONLY fails with EACCES on
+        // MAP_SHARED). O_NONBLOCK guarantees VIDIOC_DQBUF cannot trap the
+        // output worker inside the kernel while its owner requests shutdown.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(&dev_path)
             .with_context(|| format!("Failed to open {dev_path}. Is v4l2loopback loaded?"))?;
         let fd = file.as_raw_fd();
@@ -394,6 +416,7 @@ impl MmapWriter {
             height,
             frame_size,
             buffers,
+            shutdown: ShutdownHandle::default(),
         })
     }
 
@@ -415,7 +438,7 @@ impl MmapWriter {
         );
         let fd = self.file.as_raw_fd();
 
-        // A. DQBUF — dequeue a free buffer (blocking).
+        // A. DQBUF — dequeue a free buffer without blocking in the kernel.
         let mut buf: V4l2Buffer = zeroed();
         buf.typ = V4L2_BUF_TYPE_VIDEO_OUTPUT;
         buf.memory = V4L2_MEMORY_MMAP;
@@ -423,16 +446,24 @@ impl MmapWriter {
         // v4l2loopback quirk: DQBUF on OUTPUT can return EFAULT (not EAGAIN)
         // when outbufs_list is empty. Retry with a short backoff.
         loop {
+            if self.shutdown.is_requested() {
+                return Ok(());
+            }
             let ret = unsafe { libc::ioctl(fd, VIDIOC_DQBUF, &mut buf) };
             if ret == 0 {
                 break;
             }
             let err = std::io::Error::last_os_error();
             let raw = err.raw_os_error().unwrap_or(0);
-            if raw == libc::EFAULT || raw == libc::EAGAIN {
-                // No free buffer right now — yield and retry.
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
+            match dequeue_decision(raw, &self.shutdown) {
+                DequeueDecision::Retry => {
+                    // v4l2loopback reports POLLOUT while its OUTPUT stream is
+                    // active even for this EFAULT quirk, so poll would spin.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                DequeueDecision::Shutdown => return Ok(()),
+                DequeueDecision::Fail => {}
             }
             return Err(err).context("VIDIOC_DQBUF failed");
         }
@@ -464,6 +495,10 @@ impl MmapWriter {
     /// Get the device path (e.g. /dev/video10).
     pub fn device_path(&self) -> String {
         format!("/dev/video{}", self.device_num)
+    }
+
+    fn shutdown_handle(&self) -> ShutdownHandle {
+        self.shutdown.clone()
     }
 }
 
@@ -595,11 +630,44 @@ impl Backend for V4l2Backend {
     fn is_open(&self) -> bool {
         self.writer.is_some()
     }
+
+    fn shutdown_handle(&self) -> Option<ShutdownHandle> {
+        self.writer.as_ref().map(MmapWriter::shutdown_handle)
+    }
 }
 
 #[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dequeue_retry_contract_stops_after_shutdown_request() {
+        let shutdown = ShutdownHandle::default();
+
+        assert_eq!(
+            dequeue_decision(libc::EAGAIN, &shutdown),
+            DequeueDecision::Retry
+        );
+        assert_eq!(
+            dequeue_decision(libc::EFAULT, &shutdown),
+            DequeueDecision::Retry
+        );
+        assert_eq!(
+            dequeue_decision(libc::EIO, &shutdown),
+            DequeueDecision::Fail
+        );
+
+        shutdown.request();
+
+        assert_eq!(
+            dequeue_decision(libc::EAGAIN, &shutdown),
+            DequeueDecision::Shutdown
+        );
+        assert_eq!(
+            dequeue_decision(libc::EFAULT, &shutdown),
+            DequeueDecision::Shutdown
+        );
+    }
 
     #[test]
     fn ioctl_codes_match_linux_v4l2_uapi() {

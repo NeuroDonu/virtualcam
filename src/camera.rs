@@ -1,6 +1,6 @@
 //! Main Camera struct and public API
 
-use crate::backend::{self, Backend, BackendKind};
+use crate::backend::{self, Backend, BackendKind, ShutdownHandle};
 use crate::error::{Result, VirtualCamError};
 use crate::image_formats::{convert_frame, rgb24_to_nv12_scaled_into};
 use crate::pixel_format::PixelFormat;
@@ -354,6 +354,12 @@ impl Camera {
     /// Close the camera and release resources
     pub fn close(&mut self) -> Result<()> {
         self.backend.close()
+    }
+
+    /// Return a cloneable signal when the selected backend needs an external
+    /// wake-up before its output worker can be joined.
+    pub fn shutdown_handle(&self) -> Option<ShutdownHandle> {
+        self.backend.shutdown_handle()
     }
 
     /// Get the frame width

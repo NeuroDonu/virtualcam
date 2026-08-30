@@ -23,13 +23,13 @@ pub mod image_formats;
 pub mod pixel_format;
 pub mod util;
 
-pub use backend::{Backend, BackendInfo, BackendKind};
+pub use backend::{Backend, BackendInfo, BackendKind, ShutdownHandle};
 pub use camera::{Camera, CameraBuilder, available_backends};
 pub use error::{Result, VirtualCamError};
 pub use pixel_format::PixelFormat;
 
 pub mod prelude {
-    pub use crate::backend::{Backend, BackendInfo, BackendKind};
+    pub use crate::backend::{Backend, BackendInfo, BackendKind, ShutdownHandle};
     pub use crate::camera::{Camera, CameraBuilder, available_backends};
     pub use crate::error::{Result, VirtualCamError};
     pub use crate::pixel_format::PixelFormat;

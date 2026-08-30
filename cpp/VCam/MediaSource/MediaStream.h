@@ -25,9 +25,14 @@ public:
 
 public:
 	MediaStream() :
-		_index(0),
 		_state(MF_STREAM_STATE_STOPPED),
-		_format(GUID_NULL)
+		_format(GUID_NULL),
+		_width(vcam::contract::DefaultWidth),
+		_height(vcam::contract::DefaultHeight),
+		_fpsNumerator(vcam::contract::DefaultFpsNumerator),
+		_fpsDenominator(vcam::contract::DefaultFpsDenominator),
+		_sampleDuration100ns(10'000'000ULL / vcam::contract::DefaultFpsNumerator),
+		_index(0)
 	{
 		SetBaseAttributesTraceName(L"MediaStreamAtts");
 	}
@@ -52,6 +57,11 @@ private:
 	MF_STREAM_STATE _state;
 	FrameGenerator _generator;
 	GUID _format;
+	uint32_t _width;
+	uint32_t _height;
+	uint32_t _fpsNumerator;
+	uint32_t _fpsDenominator;
+	uint64_t _sampleDuration100ns;
 	wil::com_ptr_nothrow<IMFStreamDescriptor> _descriptor;
 	wil::com_ptr_nothrow<IMFMediaEventQueue> _queue;
 	wil::com_ptr_nothrow<IMFMediaSource> _source;

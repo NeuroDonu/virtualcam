@@ -20,6 +20,15 @@ HRESULT MediaStream::Initialize(IMFMediaSource* source, int index)
 
 	RETURN_IF_FAILED(MFCreateEventQueue(&_queue));
 
+	FramePump::Format producerFormat{};
+	RETURN_IF_FAILED(_generator._pump.ReadFormat(&producerFormat));
+	_width = producerFormat.width;
+	_height = producerFormat.height;
+	_fpsNumerator = producerFormat.fpsNumerator;
+	_fpsDenominator = producerFormat.fpsDenominator;
+	_sampleDuration100ns = 10'000'000ULL * _fpsDenominator / _fpsNumerator;
+	_generator.SetFrameSize(_width, _height);
+
 	// The external producer writes NV12. Advertising RGB32 as the default made
 	// consumers interpret NV12 bytes as BGRA. Publish one unambiguous format.
 	auto types = wil::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(1);
@@ -30,10 +39,11 @@ HRESULT MediaStream::Initialize(IMFMediaSource* source, int index)
 	nv12Type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
 	nv12Type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
 	nv12Type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-	MFSetAttributeSize(nv12Type.get(), MF_MT_FRAME_SIZE, vcam::contract::Width, vcam::contract::Height);
-	nv12Type->SetUINT32(MF_MT_DEFAULT_STRIDE, vcam::contract::Width);
-	MFSetAttributeRatio(nv12Type.get(), MF_MT_FRAME_RATE, vcam::contract::Fps, 1);
-	auto bitrate = static_cast<uint32_t>(vcam::contract::Width * 3ULL / 2ULL * vcam::contract::Height * 8ULL * vcam::contract::Fps);
+	RETURN_IF_FAILED(MFSetAttributeSize(nv12Type.get(), MF_MT_FRAME_SIZE, _width, _height));
+	RETURN_IF_FAILED(nv12Type->SetUINT32(MF_MT_DEFAULT_STRIDE, _width));
+	RETURN_IF_FAILED(MFSetAttributeRatio(nv12Type.get(), MF_MT_FRAME_RATE, _fpsNumerator, _fpsDenominator));
+	const auto bitrate64 = static_cast<uint64_t>(_width) * _height * 12ULL * _fpsNumerator / _fpsDenominator;
+	const auto bitrate = static_cast<uint32_t>(bitrate64 > UINT32_MAX ? UINT32_MAX : bitrate64);
 	nv12Type->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
 	MFSetAttributeRatio(nv12Type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 	types[0] = nv12Type.detach();
@@ -57,10 +67,6 @@ HRESULT MediaStream::Start(IMFMediaType* type)
 		RETURN_IF_FAILED(type->GetGUID(MF_MT_SUBTYPE, &_format));
 		WINTRACE(L"MediaStream::Start format: %s", GUID_ToStringW(_format).c_str());
 	}
-
-	// at this point, set D3D manager may have not been called
-	// so we want to create a D2D1 renter target anyway
-	RETURN_IF_FAILED(_generator.EnsureRenderTarget(vcam::contract::Width, vcam::contract::Height));
 
 	RETURN_IF_FAILED(_allocator->InitializeSampleAllocator(10, type));
 	RETURN_IF_FAILED(_queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr));
@@ -191,7 +197,7 @@ STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
 	wil::com_ptr_nothrow<IMFSample> sample;
 	RETURN_IF_FAILED(_allocator->AllocateSample(&sample));
 	RETURN_IF_FAILED(sample->SetSampleTime(MFGetSystemTime()));
-	RETURN_IF_FAILED(sample->SetSampleDuration(vcam::contract::SampleDuration100ns));
+	RETURN_IF_FAILED(sample->SetSampleDuration(_sampleDuration100ns));
 
 	// generate frame
 	wil::com_ptr_nothrow<IMFSample> outSample;

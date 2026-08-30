@@ -1,7 +1,34 @@
 //! Platform virtual-camera backends.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use crate::error::{Result, VirtualCamError};
 use crate::pixel_format::PixelFormat;
+
+/// One-way, cloneable signal used to interrupt a backend during teardown.
+///
+/// Most backends complete `send` immediately and therefore do not expose a
+/// handle. Linux V4L2 uses it to make a pending nonblocking dequeue loop
+/// cancellable before its owner joins the output worker.
+#[derive(Debug, Clone, Default)]
+pub struct ShutdownHandle {
+    requested: Arc<AtomicBool>,
+}
+
+impl ShutdownHandle {
+    /// Request terminal backend shutdown. Repeated requests are harmless.
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Whether terminal backend shutdown has been requested.
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
 
 /// A platform backend selected explicitly or through [`BackendKind::Auto`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -60,6 +87,12 @@ pub trait Backend: Send {
     fn send(&mut self, frame: &[u8]) -> Result<()>;
     fn close(&mut self) -> Result<()>;
     fn is_open(&self) -> bool;
+
+    /// Optional out-of-thread shutdown signal for a backend whose `send`
+    /// operation may wait for an operating-system buffer.
+    fn shutdown_handle(&self) -> Option<ShutdownHandle> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +203,20 @@ pub fn create_any_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_handle_clones_share_a_one_way_signal() {
+        let handle = ShutdownHandle::default();
+        let observer = handle.clone();
+
+        assert!(!handle.is_requested());
+        assert!(!observer.is_requested());
+
+        handle.request();
+
+        assert!(handle.is_requested());
+        assert!(observer.is_requested());
+    }
 
     #[test]
     fn backend_names_roundtrip() {
